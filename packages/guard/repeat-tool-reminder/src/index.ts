@@ -19,7 +19,7 @@ declare module '@deepseek-ai/dsh-llm' {
 
 import type { MessageSource } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
-import type { PostToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
+import type { PostToolDecision, PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 
 export const name = 'repeat-tool-reminder'
 
@@ -42,6 +42,19 @@ export interface Config {
    * variant resets that chain's count.
    */
   alternationCycles?: number
+  /**
+   * local-mods: full alternation cycles after which the next pair call of a
+   * bookkeeping tool is denied outright (default `5`). Reminders alone did not
+   * stop degraded models; must be an integer >= alternationCycles.
+   */
+  alternationDenyCycles?: number
+  /**
+   * local-mods: tools whose pure alternation loop performs no work by
+   * definition (bookkeeping only, no side effects) and may therefore be denied
+   * (default `['todo_write']`). Stateful tools stay reminder-only: whether an
+   * A/B loop of them is legitimate needs task semantics this guard lacks.
+   */
+  bookkeepingTools?: string[]
   /** Tool-name patterns to track; empty means every tool is tracked. */
   include?: string[]
   /** Tool-name patterns transparent to the chain (neither count nor reset). */
@@ -59,6 +72,8 @@ export interface Config {
 export const Config: z<Config> = z.object({
   thresholds: z.array(z.number()).default([3, 5, 8]),
   alternationCycles: z.number().default(3),
+  alternationDenyCycles: z.number().default(5),
+  bookkeepingTools: z.array(z.string()).default(['todo_write']),
   include: z.array(z.string()).default([]),
   exclude: z.array(z.string()).default([]),
   argumentsPreviewChars: z.number().default(500),
@@ -181,7 +196,11 @@ interface Chain {
   count: number
   /** local-mods: recent tracked call keys, newest last, bounded to the alternation window. */
   recent: string[]
-  /** local-mods: whether the current alternation episode already emitted its reminder. */
+  /** local-mods: consecutive calls confirming the current alternation episode. */
+  streak: number
+  /** local-mods: the alternating pair's keys while an episode is active. */
+  pairKeys: [string, string] | undefined
+  /** local-mods: whether the current episode already emitted its reminder. */
   alternationReminded: boolean
 }
 
@@ -237,13 +256,21 @@ export function apply(ctx: Context, config: Config): void {
     const recent = [...chain?.recent ?? [], key].slice(-alternationWindow)
     const evenKeys = recent.filter((_, index) => index % 2 === 0)
     const oddKeys = recent.filter((_, index) => index % 2 === 1)
+    const evenKey = evenKeys[0]
+    const oddKey = oddKeys[0]
     const alternating = recent.length === alternationWindow
+      && evenKey !== undefined && oddKey !== undefined
       && new Set(evenKeys).size === 1
       && new Set(oddKeys).size === 1
-      && evenKeys[0] !== oddKeys[0]
-    const alternationReminded = alternating && (chain?.alternationReminded ?? false)
-    chains.set(exec.agent, { key, count, recent, alternationReminded: alternating ? alternationReminded : false })
-    if (alternating && !alternationReminded) {
+      && evenKey !== oddKey
+    const streak = alternating ? (chain?.streak ?? 0) + 1 : 0
+    const pairKeys: [string, string] | undefined = alternating && evenKey !== undefined && oddKey !== undefined
+      ? [evenKey, oddKey]
+      : undefined
+    const shouldRemind = streak === alternationWindow && !(chain?.alternationReminded ?? false)
+    const alternationReminded = shouldRemind || (alternating && (chain?.alternationReminded ?? false))
+    chains.set(exec.agent, { key, count, recent, streak, pairKeys, alternationReminded })
+    if (shouldRemind) {
       return createUserMessage({
         content: [{ type: 'text', text: ALTERNATION_REMINDER }],
         source: { ...REMINDER_SOURCE, form: 'notice', summary: `${exec.name} alternating × ${alternationCycles}` },
@@ -258,6 +285,37 @@ export function apply(ctx: Context, config: Config): void {
       source: { ...REMINDER_SOURCE, form: 'notice', summary: `${exec.name} × ${count}` },
     })
   }
+
+  // local-mods: hard fuse for pure bookkeeping alternation. A loop consisting
+  // solely of bookkeeping-tool calls performs no work by definition — no task
+  // semantics needed. Once the episode reaches alternationDenyCycles full
+  // cycles, the next pair call is denied with an actionable reason; reminders
+  // alone proved insufficient for degraded models. Any different call breaks
+  // the ring and re-arms nothing until a fresh episode forms.
+  const alternationDenyCycles = config.alternationDenyCycles as number
+  if (!Number.isInteger(alternationDenyCycles) || alternationDenyCycles < alternationCycles) {
+    throw new Error(
+      `repeat-tool-reminder: invalid alternationDenyCycles ${alternationDenyCycles} — must be an integer >= alternationCycles (${alternationCycles})`,
+    )
+  }
+  const bookkeeping = new Set(config.bookkeepingTools as string[])
+  ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
+    if (exec.agent === undefined || !bookkeeping.has(exec.name)) return next()
+    const chain = chains.get(exec.agent)
+    if (chain === undefined || chain.pairKeys === undefined) return next()
+    const canonical = canonicalize(exec.arguments)
+    const key = JSON.stringify([exec.name, canonical])
+    if (key !== chain.pairKeys[0] && key !== chain.pairKeys[1]) return next()
+    const cycles = Math.floor(chain.streak / 2)
+    if (cycles < alternationDenyCycles) return next()
+    return {
+      kind: 'deny',
+      reason: 'Blocked: this call would continue an alternation loop — '
+        + `${cycles} full cycles of ${exec.name} between two argument variants with `
+        + 'no other work in between. Flipping status does not execute the task. Call '
+        + 'a different tool that performs the real next action, or finish the task.',
+    }
+  })
 
   // Observe-and-enrich, never veto: count first (state advances regardless of
   // the downstream outcome), DELEGATE so a later listener can still block or
