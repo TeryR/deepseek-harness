@@ -15,4 +15,6 @@ export interface Config {
   default: string
   /** User-selected default; edited through Settings. */
   selectedDefault: Volatile<string | undefined>
+  /** local-mods: preset ids hidden from the selection roster; still registered and resolvable for delegation. */
+  hidden?: readonly string[]
 }
