@@ -54,6 +54,7 @@ export class AgentPresetRegistry extends TypertRemoteService {
   static Config = z.object({
     default: z.string().required(),
     selectedDefault: z.string().volatile(),
+    hidden: z.array(z.string()).optional(),
   })
   private readonly owner: Context
   private readonly definitions = new Map<string, Definition>()
@@ -185,7 +186,10 @@ export class AgentPresetRegistry extends TypertRemoteService {
         ...(broken === undefined ? {} : { broken }),
       }
     }))
-    return rows.sort((a, b) => (a.order ?? Infinity) - (b.order ?? Infinity) || a.id.localeCompare(b.id))
+    // local-mods: drop rows hidden through config before sorting the roster
+    const hidden = this.config.hidden ?? []
+    return rows.filter(row => !hidden.includes(row.id))
+      .sort((a, b) => (a.order ?? Infinity) - (b.order ?? Infinity) || a.id.localeCompare(b.id))
   }
 
   /** Read the selection roster.
