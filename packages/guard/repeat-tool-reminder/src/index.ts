@@ -35,6 +35,13 @@ export const name = 'repeat-tool-reminder'
 export interface Config {
   /** Consecutive-repeat counts that trigger a reminder (default `[3, 5, 8]`). */
   thresholds?: number[]
+  /**
+   * local-mods: alternating A/B cycles of one tool that trigger the alternation
+   * reminder (default `3` — three full A,B,A,B,A,B cycles, six calls). Catches
+   * status-toggle loops the identical-args chain can never see, because each
+   * variant resets that chain's count.
+   */
+  alternationCycles?: number
   /** Tool-name patterns to track; empty means every tool is tracked. */
   include?: string[]
   /** Tool-name patterns transparent to the chain (neither count nor reset). */
@@ -51,6 +58,7 @@ export interface Config {
 
 export const Config: z<Config> = z.object({
   thresholds: z.array(z.number()).default([3, 5, 8]),
+  alternationCycles: z.number().default(3),
   include: z.array(z.string()).default([]),
   exclude: z.array(z.string()).default([]),
   argumentsPreviewChars: z.number().default(500),
@@ -72,6 +80,18 @@ const GENTLE_REMINDER =
   + 'Carefully analyze the previous result before calling again: if the task is '
   + 'not complete, try a different approach or different arguments instead of '
   + 'repeating the call.'
+
+/**
+ * local-mods: the alternation reminder for A/B toggle loops. State flips do not
+ * perform work; the model narrates action instead of taking it.
+ */
+const ALTERNATION_REMINDER =
+  'You are alternating between two variants of the same tool call (for example '
+  + 'toggling a status field between two values) with no other action making '
+  + 'progress in between. This is a loop: flipping state back and forth does not '
+  + 'perform the underlying work. Inspect the latest results, then either take '
+  + 'the real next action with a different tool or different arguments, or '
+  + 'finish the task if it is already complete.'
 
 /** The detailed later-threshold reminder naming the tool, the run length, and the canonical arguments. */
 function detailedReminder(toolName: string, count: number, canonicalArguments: string): string {
@@ -155,10 +175,14 @@ function prependContext(ours: UserMessage, theirs: UserMessage[] | undefined): U
   return [ours, ...theirs ?? []]
 }
 
-/** One agent's consecutive-repeat chain: the last tracked call's identity key and its run length. */
+/** One agent's repeat chain: last tracked key, run length, and the local-mods alternation ring. */
 interface Chain {
   key: string
   count: number
+  /** local-mods: recent tracked call keys, newest last, bounded to the alternation window. */
+  recent: string[]
+  /** local-mods: whether the current alternation episode already emitted its reminder. */
+  alternationReminded: boolean
 }
 
 /**
@@ -170,6 +194,12 @@ export function apply(ctx: Context, config: Config): void {
   // schemastery's .default() guarantees the fields are set after validation.
   const thresholds = validateThresholds(config.thresholds as number[])
   const thresholdSet = new Set(thresholds)
+  // local-mods: alternation window — a multiple of two calls (one full A,B cycle).
+  const alternationCycles = config.alternationCycles as number
+  if (!Number.isInteger(alternationCycles) || alternationCycles < 2) {
+    throw new Error(`repeat-tool-reminder: invalid alternationCycles ${alternationCycles} — must be an integer >= 2`)
+  }
+  const alternationWindow = alternationCycles * 2
   const includePatterns = (config.include as string[]).map(wildcardToRegExp)
   const excludePatterns = (config.exclude as string[]).map(wildcardToRegExp)
   const argumentsPreviewChars = config.argumentsPreviewChars as number
@@ -202,7 +232,23 @@ export function apply(ctx: Context, config: Config): void {
     const key = JSON.stringify([exec.name, canonical])
     const chain = chains.get(exec.agent)
     const count = chain !== undefined && chain.key === key ? chain.count + 1 : 1
-    chains.set(exec.agent, { key, count })
+    // local-mods: maintain the recent-key ring and test for a period-2 alternation
+    // (the identical-args chain above can never see A,B,A,B — each variant resets it).
+    const recent = [...chain?.recent ?? [], key].slice(-alternationWindow)
+    const evenKeys = recent.filter((_, index) => index % 2 === 0)
+    const oddKeys = recent.filter((_, index) => index % 2 === 1)
+    const alternating = recent.length === alternationWindow
+      && new Set(evenKeys).size === 1
+      && new Set(oddKeys).size === 1
+      && evenKeys[0] !== oddKeys[0]
+    const alternationReminded = alternating && (chain?.alternationReminded ?? false)
+    chains.set(exec.agent, { key, count, recent, alternationReminded: alternating ? alternationReminded : false })
+    if (alternating && !alternationReminded) {
+      return createUserMessage({
+        content: [{ type: 'text', text: ALTERNATION_REMINDER }],
+        source: { ...REMINDER_SOURCE, form: 'notice', summary: `${exec.name} alternating × ${alternationCycles}` },
+      })
+    }
     if (!thresholdSet.has(count)) return undefined
     const text = count === thresholds[0]
       ? GENTLE_REMINDER
